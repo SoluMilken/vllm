@@ -6,8 +6,9 @@ import hashlib
 import inspect
 import os
 import pickle
+import sys
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import patch
 
 import torch
@@ -16,12 +17,18 @@ from torch.fx._graph_pickler import GraphPickler, Options
 from torch.utils import _pytree as pytree
 
 import vllm.envs as envs
+from vllm.compilation.aot import _compute_code_hash_with_content
 from vllm.compilation.compiler_interface import get_inductor_factors
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
 from vllm.config.utils import hash_factors
 from vllm.logger import init_logger
-from vllm.utils.hashing import safe_hash
+
+if TYPE_CHECKING:
+    try:
+        from torch._dynamo.package import SourceInfo
+    except ImportError:
+        SourceInfo = Any
 
 try:
     from torch._dynamo.aot_compile import SerializableCallable
@@ -532,40 +539,220 @@ def reconstruct_serializable_fn_from_mega_artifact(
     )
     return fn
 
+    """Manages the on-disk cache for AOT (Ahead-Of-Time) compiled models.
 
-def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
-    factors = []
-    # 0. factors come from the env, for example, The values of
-    # VLLM_PP_LAYER_PARTITION will affect the computation graph.
-    env_hash = hash_factors(envs.compile_factors())
-    factors.append(env_hash)
+    Background
+    ----------
+    vLLM can use ``torch.compile`` in AOT mode to compile a model once and
+    serialize the result to disk.  On the next startup the compiled artifact
+    is loaded directly, skipping the expensive compilation step entirely.
 
-    # 1. factors come from the vllm_config (it mainly summarizes how the
-    #    model is created)
-    config_hash = vllm_config.compute_hash()
-    factors.append(config_hash)
+    This class owns three responsibilities:
 
-    # 2. inductor factors if applicable
+    1. **Path computation** (``__init__``): deterministically derive the cache
+       directory from the vLLM config + the model's ``forward`` function so
+       that a different model or config automatically maps to a different path.
+
+    2. **Loading** (``try_load``): deserialize a previously saved artifact,
+       verify that no source files have changed since it was compiled, and
+       return the ready-to-call compiled function.
+
+    3. **Saving** (``save``): atomically write a freshly compiled function to
+       the cache directory so future runs can skip compilation.
+
+    Typical call flow
+    -----------------
+    ::
+
+        cache = AotCompileCache(vllm_config, model.forward)
+
+        compiled_fn = cache.try_load(model)   # fast path: load from disk
+        if compiled_fn is None:
+            compiled_fn = compile(model)       # slow path: actually compile
+            cache.save(compiled_fn, was_loaded_from_disk=False)
+    """
+
+    def __init__(self, vllm_config: VllmConfig, forward_fn: Callable[..., Any]) -> None:
+        """Compute and store the cache path for this (config, model) pair.
+
+        The directory is derived from a hash of:
+        - environment variables that affect compilation (e.g. PP layer partition)
+        - the full ``VllmConfig`` (model size, parallelism, quantization, …)
+        - the identity of ``forward_fn`` (version + qualified name + line number)
+
+        Each tensor-parallel rank gets its own sub-directory because compiled
+        artifacts can differ across ranks (e.g. different weight shards).
+        """
+        hash_key = _compute_hash_key(vllm_config, forward_fn)
+        rank = vllm_config.parallel_config.rank
+        dp_rank = vllm_config.parallel_config.data_parallel_index
+
+        self.cache_dir = os.path.join(
+            envs.VLLM_CACHE_ROOT,
+            "torch_compile_cache",
+            "torch_aot_compile",
+            hash_key,
+            f"rank_{rank}_{dp_rank}",
+        )
+        self.artifact_path = os.path.join(self.cache_dir, "model")
+        self._vllm_config = vllm_config
+        self._loaded_from_disk = False
+
+    def try_load(self, model: torch.nn.Module) -> "VllmSerializableFunction | None":
+        """Try to load an AOT-compiled function from disk.
+
+        Steps performed on a cache hit:
+
+        1. Deserialize the compiled artifact using PyTorch's
+           ``load_compiled_function``.  ``model.forward.__globals__`` is
+           passed so that global symbols (custom ops, helpers, …) that were
+           captured during the original trace can be resolved correctly.
+        2. Verify that none of the traced source files have changed since the
+           artifact was created (``_verify_source_unchanged``).
+        3. Optionally disable shape guards if the config says so.
+        4. Finalize the compiled backend (loads Inductor kernels, etc.).
+
+        Returns the loaded callable on success, or ``None`` on any failure so
+        the caller can fall back to recompilation.  Re-raises if
+        ``VLLM_FORCE_AOT_LOAD`` is set, which is useful for CI environments
+        that must never recompile.
+        """
+        from vllm.compilation.decorators import maybe_use_cudagraph_partition_wrapper
+        from vllm.compilation.monitor import monitor_torch_compile
+
+        try:
+            with monitor_torch_compile(self._vllm_config):
+                with (
+                    set_current_vllm_config(self._vllm_config),
+                    open(self.artifact_path, "rb") as f,
+                ):
+                    loaded_fn = torch.compiler.load_compiled_function(
+                        f, f_globals=model.forward.__globals__
+                    )
+                _verify_source_unchanged(loaded_fn.source_info(), self._vllm_config)
+                ds_config = self._vllm_config.compilation_config.dynamic_shapes_config
+                if not ds_config.evaluate_guards:
+                    loaded_fn.disable_guard_check()
+                with maybe_use_cudagraph_partition_wrapper(self._vllm_config):
+                    loaded_fn._artifacts.compiled_fn.finalize_loading(self._vllm_config)
+            compilation_counter.num_aot_artifacts_loaded += 1
+            self._loaded_from_disk = True
+            logger.info(
+                "Directly load AOT compilation from path %s", self.artifact_path
+            )
+            return loaded_fn
+        except Exception as e:
+            if os.path.exists(self.artifact_path):
+                if isinstance(e, EOFError):
+                    message = "Compile cache file corrupted."
+                else:
+                    message = str(e)
+                logger.warning(
+                    "Compiling model again due to a load failure from %s, reason: %s",
+                    self.artifact_path,
+                    message,
+                )
+            if envs.VLLM_FORCE_AOT_LOAD:
+                raise e
+            return None
+
+    def save(self, compiled_fn: Any) -> None:
+        """Persist a freshly compiled function to disk.
+
+        Skipped entirely if:
+        - the compile cache is disabled (``VLLM_DISABLE_COMPILE_CACHE``)
+        - the artifact was itself loaded from disk (no point re-saving it)
+
+        The write is atomic: the artifact is first serialized to a temporary
+        file ``<path>.<pid>.tmp`` and then renamed into place, so a crash
+        during saving never leaves a corrupt cache entry.
+        """
+        if envs.VLLM_DISABLE_COMPILE_CACHE:
+            return
+        if self._loaded_from_disk:
+            logger.debug("AOT compiled function was loaded from cache, skipping save")
+            return
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            # File saving should be atomic, so we will save to a temporary location
+            # first. Should be upstreamed to PyTorch 2.12 as well.
+            tmp_file = f"{self.artifact_path}.{os.getpid()}.tmp"
+            compiled_fn.save_compiled_function(tmp_file)
+            os.replace(tmp_file, self.artifact_path)
+            compilation_counter.num_aot_artifacts_saved += 1
+            logger.info_once(
+                "saved AOT compiled function to %s",
+                self.artifact_path,
+                scope="local",
+            )
+        except Exception as e:
+            logger.warning(
+                "unable to save AOT compiled function to %s: %s",
+                self.artifact_path,
+                e,
+            )
+
+
+def _compute_hash_key(vllm_config: VllmConfig, forward_fn: Callable[..., Any]) -> str:
+    """Derive a deterministic cache key from config + model identity.
+
+    Combines all factors that can change the compiled output:
+
+    - environment variables (e.g. ``VLLM_PP_LAYER_PARTITION``)
+    - the full ``VllmConfig`` (model size, parallelism, quantization, …)
+    - Inductor compile factors (if ``VLLM_USE_MEGA_AOT_ARTIFACT``)
+    - the identity of the ``forward`` function (version + name + line number)
+    """
+    factors: list[str] = [
+        hash_factors(envs.compile_factors()),
+        vllm_config.compute_hash(),
+    ]
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
+    factors.append(_model_hash_key(forward_fn))
+    return hashlib.sha256(str(factors).encode()).hexdigest()
 
-    return factors
+
+def _model_hash_key(fn: Callable[..., Any]) -> str:
+    """Produce a stable hash that uniquely identifies a ``forward`` method.
+
+    The hash combines the vLLM version, the fully-qualified function name,
+    and its line number in the source file.  This means that if the function
+    is renamed, moved, or the library is upgraded, the hash changes and the
+    old cache entry is ignored.
+    """
+    import vllm
+
+    sha256_hash = hashlib.sha256()
+    sha256_hash.update(vllm.__version__.encode())
+    sha256_hash.update(fn.__qualname__.encode())
+    sha256_hash.update(str(fn.__code__.co_firstlineno).encode())
+    return sha256_hash.hexdigest()
 
 
-def _compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
-    items = list(sorted(file_contents.items(), key=lambda x: x[0]))
-    hash_content = []
-    for filepath, content in items:
-        hash_content.append(filepath)
-        if filepath == "<string>":
-            # This means the function was dynamically generated, with
-            # e.g. exec(). We can't actually check these.
-            continue
-        hash_content.append(content)
-    result: str = safe_hash(
-        "\n".join(hash_content).encode(), usedforsecurity=False
-    ).hexdigest()
-    return result
+def _verify_source_unchanged(source_info: Any, vllm_config: VllmConfig) -> None:
+    """Guard against loading a stale cache artifact.
+
+    When a model is AOT-compiled, Dynamo records the content of every
+    Python source file it traced through (``source_info.inlined_sources``).
+    This method re-reads those files from disk and compares their checksums
+    against what was recorded at compile time.
+
+    Raises ``RuntimeError`` if any file has changed, which causes the
+    caller to fall back to recompilation.
+    """
+    file_contents = {}
+    for source in source_info.inlined_sources:
+        module = sys.modules[source.module]
+        file = inspect.getfile(module)
+        vllm_config.compilation_config.traced_files.add(file)
+        file_contents[file] = source.content
+    expected_checksum = _compute_code_hash_with_content(file_contents)
+    actual_checksum = _compute_code_hash(set(file_contents.keys()))
+    if expected_checksum != actual_checksum:
+        raise RuntimeError(
+            "Source code has changed since the last compilation. Recompiling the model."
+        )
 
 
 def _compute_code_hash(files: set[str]) -> str:

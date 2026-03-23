@@ -323,15 +323,11 @@ def reset_compile_wrapper(model: torch.nn.Module) -> None:
     compilation_counter.num_aot_artifacts_saved = 0
     compilation_counter.num_aot_artifacts_loaded = 0
 
-    # Clear the AOT compiled function so the model is forced to
-    # recompile on the next call. Without this, decorators.py
-    # __call__ uses the stale aot_compiled_fn whose torchinductor
-    # kernels have old parameters (expert_map size for example)
-    # baked in as compile-time constants.
-    if hasattr(model, "aot_compiled_fn"):
-        model.aot_compiled_fn = None
-    if hasattr(model, "was_aot_compile_fn_loaded_from_disk"):
-        model.was_aot_compile_fn_loaded_from_disk = False
+    # Clear the AOT runner so the model is forced to recompile on the
+    # next call. Without this, stale Inductor kernels with old parameters
+    # (e.g. expert_map size) baked in as compile-time constants would be used.
+    if hasattr(model, "_aot_runner") and model._aot_runner is not None:
+        model._aot_runner.reset()
 
     # Reset the cache_dir so VllmBackend recomputes the hash
     # (data_parallel_size changed, so the config hash differs).
