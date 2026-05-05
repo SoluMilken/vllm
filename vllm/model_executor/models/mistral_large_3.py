@@ -37,7 +37,10 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     # fmt: on
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return super().load_weights(map(self._remap_mistral_to_ds, weights))
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(map(self._remap_mistral_to_ds, weights))
 
     def _remap_mistral_to_ds(
         self, weight: tuple[str, torch.Tensor]
